@@ -911,6 +911,12 @@ final class AppState: ObservableObject {
                     do {
                         _ = try await claudeService.getAuthStatus()
                         log.info("[fetchUsage] Delegated refresh completed for active account.")
+                        // Give the refresh a moment before retrying: an immediate
+                        // back-to-back retry was observed tripping the endpoint's
+                        // own rate limit (429, Retry-After up to 3600s) - the same
+                        // burst pattern the cross-account stagger below already
+                        // exists to avoid, just not applied to this retry.
+                        try? await Task.sleep(nanoseconds: 1_500_000_000)
                         // Re-read refreshed token and retry
                         if let refreshedJSON = keychain.readClaudeToken(),
                            let refreshedToken = ClaudeService.extractAccessToken(from: refreshedJSON),
@@ -919,6 +925,30 @@ final class AppState: ObservableObject {
                             accountUsageSampledAt[account.id] = Date()
                             accountUsageErrors[account.id] = nil
                             log.info("[fetchUsage] Recovered \(account.email) via delegated refresh.")
+                        } else if let notBefore = usageRetryNotBefore[account.id], notBefore > Date() {
+                            // The retry itself got rate-limited and is now parked.
+                            // The token is NOT necessarily dead - a transient expiry
+                            // followed by a 429 on the very next request is the
+                            // observed normal case (the same credential worked again
+                            // minutes later). "Re-authenticate" would be wrong advice
+                            // here; say what's actually true instead.
+                            log.warning("[fetchUsage] Retry for \(account.email) was rate-limited; parked")
+                            if accountUsage[account.id] == nil {
+                                accountUsageErrors[account.id] = UsageErrorState(isExpired: false, isRateLimited: true, message: String(localized: "API Rate Limited. Try again later.", bundle: L10n.bundle))
+                            }
+                        } else {
+                            // `claude auth status` exited 0 but did not actually
+                            // restore usage access, and it wasn't a rate limit
+                            // either (still unauthorized, network, decode...).
+                            // Leaving this silent kept both accountUsage and the
+                            // error nil forever, which the UI renders as "Waiting
+                            // for usage data..." — indistinguishable from "not
+                            // polled yet" even though every cycle was failing the
+                            // same way.
+                            log.warning("[fetchUsage] Delegated refresh did not restore usage access for \(account.email)")
+                            accountUsage[account.id] = nil
+                            accountUsageSampledAt[account.id] = nil
+                            accountUsageErrors[account.id] = UsageErrorState(isExpired: true, isRateLimited: false, message: String(localized: "Session expired. Re-authenticate (↻) to fix.", bundle: L10n.bundle))
                         }
                     } catch {
                         log.error("[fetchUsage] Delegated refresh failed for active account: \(error.localizedDescription)")
@@ -935,12 +965,31 @@ final class AppState: ObservableObject {
                     switch await refreshBackupInPlace(for: account) {
                     case .refreshed(let refreshed):
                         log.info("[fetchUsage] Silently refreshed backup for \(account.email); retrying usage")
+                        // Same burst-into-rate-limit risk as the active-account path.
+                        try? await Task.sleep(nanoseconds: 1_500_000_000)
                         if let newToken = ClaudeService.extractAccessToken(from: refreshed),
                            let usage = await usageRespectingParking(accessToken: newToken, account: account) {
                             accountUsage[account.id] = usage
                             accountUsageSampledAt[account.id] = Date()
                             accountUsageErrors[account.id] = nil
                             log.info("[fetchUsage] \(account.email): session=\(usage.fiveHour?.utilization ?? -1)%, weekly=\(usage.sevenDay?.utilization ?? -1)%")
+                        } else if let notBefore = usageRetryNotBefore[account.id], notBefore > Date() {
+                            // Rate-limited, not dead - same distinction as the
+                            // active-account path. Keep any stale sample.
+                            log.warning("[fetchUsage] Retry for \(account.email) was rate-limited; parked")
+                            if accountUsage[account.id] == nil {
+                                accountUsageErrors[account.id] = UsageErrorState(isExpired: false, isRateLimited: true, message: String(localized: "API Rate Limited. Try again later.", bundle: L10n.bundle))
+                            }
+                        } else {
+                            // The rotation itself succeeded and persisted, but the
+                            // retry still failed for some other reason (still
+                            // unauthorized, network, decode...). Same silent-gap
+                            // risk as the active-account path above: without this,
+                            // a persistently-failing retry left the card stuck on
+                            // "Waiting for usage data..." forever instead of an
+                            // honest, retryable error.
+                            log.warning("[fetchUsage] Backup refreshed but retry still failed for \(account.email)")
+                            accountUsageErrors[account.id] = UsageErrorState(isExpired: false, isRateLimited: false, message: String(localized: "Could not fetch usage after refreshing sign-in; will retry automatically.", bundle: L10n.bundle))
                         }
                     case .grantRejected, .noBackup, .rotationLost:
                         // Only re-authentication mints a new refresh token or a
